@@ -1,4 +1,3 @@
-import enum
 from typing import Optional
 import torch
 from tqdm import tqdm
@@ -35,7 +34,7 @@ class SpecInfer():
         return mask, parent_indices
 
     
-    def text_completion(self, prompts: list[str], exp_cfg: list[int], temperature: float = 0.6, top_p: float = 0.9, max_gen_len: Optional[int] = None):
+    def text_completion(self, prompts: list[str], exp_cfg: list[int], temperature: float = 0.6, top_p: float = 0.9, top_k: int = 3, max_gen_len: Optional[int] = None):
         device = self.args.device
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
@@ -82,9 +81,8 @@ class SpecInfer():
                 tokens[:, cur_pos] = next_token
                 eos_reached |= (~prompt_tokens_mask[:, cur_pos]) & (next_token == self.tokenizer.eos_id())
     
-
+        process_bar = tqdm(total = total_len - max_prompt_len, desc = "Generating Tokens")
         tree_mask, parent_indices = self._build_tree_mask(exp_cfg, device)
-
         #SpecInfer
         cur_pos = max_prompt_len
         while cur_pos < total_len and not eos_reached.all():
@@ -117,18 +115,76 @@ class SpecInfer():
                                                     use_cache = False) #(B, all_draft_token, vocab_size)
                     
                     sub_probs_q = torch.softmax(logits_q[:, prev_start: prev_start + prev_count], dim = -1) #(B, prev_count, vocab_size)
-                    prob_value, token_idx = torch.topk(sub_probs_q, value, dim = -1) #(B, prev_count, )
+                    prob_value, token_idx = torch.topk(sub_probs_q, value, dim = -1) #(B, prev_count, value)
                     for p_idx in range(prev_count):
                         for v in range(value):
-                            draft_tokens.append(token_idx[:, p_idx, v].unsqueeze(-1))  # (B, 1)
+                            draft_tokens.append(token_idx[:, p_idx, v : v+1])  # (B, 1)
                     prev_start += prev_count
                     prev_count *= value
             
             #Evaluation
-            logits_p = self.Mp.model.forward(tokens = torch.cat(draft_tokens[:], dim = 1), start_pos = cur_pos - 1, 
+            O = torch.cat(draft_tokens[:], dim = 1) # (B, all_draft_token)
+
+            logits_p = self.Mp.model.forward(tokens = O, start_pos = cur_pos - 1, 
                                             logical_pos = torch.tensor(logical_positions, device = device), mask = tree_mask, 
                                             use_cache = False) #(B, all_draft_token, vocab_size)
-            
+
+            probs_p = torch.softmax(logits_p, dim = -1) #(B, all_draft_token, vocab_size)
+
+            N = torch.cat([torch.zeros((probs_p.shape[0], 1, probs_p.shape[2]), device = device), probs_p[:, 0 : logits_p.shape[1] - 1, :]], dim = 1) #(B, all_draft_token, vocab_size)
+
+            # Accept and Reject
+            V = self.verify_greedy(O, N, parent_indices) # (B, accepted_token)
+            if V is None:
+                actual_accepted_token = 1
+                tokens[:, cur_pos : cur_pos + actual_accepted_token] = self.Mp._sample_top_k(probs_p[:, 0], k = top_k)
+                self.Mq.model.forward(tokens[:, cur_pos - 1 : cur_pos + actual_accepted_token - 1], start_pos = cur_pos - 1)
+                self.Mp.model.forward(tokens[:, cur_pos - 1 : cur_pos + actual_accepted_token - 1], start_pos = cur_pos - 1)
+            else:
+                actual_accepted_token = min(total_len - cur_pos, V.shape[-1])
+                tokens[:, cur_pos : cur_pos + actual_accepted_token] = V[:, : actual_accepted_token] # (B, accepted_token)
+                self.Mq.model.forward(tokens[:, cur_pos - 1 : cur_pos + actual_accepted_token - 1], start_pos = cur_pos - 1)
+                self.Mp.model.forward(tokens[:, cur_pos - 1 : cur_pos + actual_accepted_token - 1], start_pos = cur_pos - 1)
+
+            for i in range(actual_accepted_token):
+                eos_reached |= (tokens[:, cur_pos + i] == self.tokenizer.eos_id())
+            process_bar.update(actual_accepted_token)
+            cur_pos += actual_accepted_token    
+        process_bar.close()
+
+        print(f"Generating tokens in {time.time() - start:.2f} seconds")
+
+        out_tokens = []
+        out_text = []
+        for prompt_index, current_prompt_tokens in enumerate(tokens.tolist()):
+            # Cut to the EOS token, if present
+            if self.tokenizer.eos_id() in current_prompt_tokens:
+                eos_idx = current_prompt_tokens.index(self.tokenizer.eos_id())
+                current_prompt_tokens = current_prompt_tokens[:eos_idx]
+            out_tokens.append(current_prompt_tokens)
+            out_text.append(self.tokenizer.decode(current_prompt_tokens))
+        return (out_tokens, out_text)
+
+
+    def verify_greedy(self, O: torch.tensor, N: torch.tensor, parent_index: list):
+        # O (B, all_draft_token)
+        # N (B, all_draft_token, vocab_size)
+        # parent_index (all_draft_token, )
+        root = 0
+        V = []
+        keeping = True
+        while keeping:
+            keeping = False
+            for index, p_index in enumerate(parent_index):
+                if p_index == root and (O[:, index] == torch.argmax(N[:, index], dim = -1)).all():
+                    keeping = True
+                    V.append(O[:, index : index+1]) #(B, 1)
+                    root = index 
+                    break
+        if len(V) != 0:
+            return torch.cat(V[:], dim = 1) # (B, accepted_token)
+        return None
+
 
             
                 
