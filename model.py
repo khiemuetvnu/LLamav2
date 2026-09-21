@@ -105,14 +105,16 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias = False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias = False)
 
-        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
-        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim))
+        self.cache_k = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim)).to(device = args.device)
+        self.cache_v = torch.zeros((args.max_batch_size, args.max_seq_len, self.n_kv_heads, self.head_dim)).to(device = args.device)
 
     def forward(
             self,
             x: torch.Tensor,
             start_pos: int,
-            freqs_complex: torch.Tensor
+            freqs_complex: torch.Tensor,
+            mask: torch.Tensor = None,
+            use_cache = True
     ):
         batch_size, seq_len, _ = x.shape # (B, 1, Dim)
 
@@ -136,13 +138,19 @@ class SelfAttention(nn.Module):
         xk = apply_rotary_embeddings(xk, freqs_complex, device =x.device)
 
         # Replace the entry in the cache
-        self.cache_k[:batch_size, start_pos : start_pos + seq_len] = xk 
-        self.cache_v[:batch_size, start_pos : start_pos + seq_len] = xv
+        if use_cache:
+            self.cache_k[0 : batch_size, start_pos : start_pos + seq_len] = xk 
+            self.cache_v[0 : batch_size, start_pos : start_pos + seq_len] = xv
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            keys = self.cache_k[0 : batch_size, 0 : start_pos + seq_len]
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            values = self.cache_v[0 : batch_size, 0 : start_pos + seq_len]
+        else:   
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            keys = torch.cat([self.cache_k[0 : batch_size, 0 : start_pos], xk], dim=1)
+            # (B, Seq_Len_KV, H_KV, Head_Dim)
+            values = torch.cat([self.cache_v[0 : batch_size, 0 : start_pos], xv], dim=1)
 
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        keys = self.cache_k[:batch_size, : start_pos + seq_len]
-        # (B, Seq_Len_KV, H_KV, Head_Dim)
-        values = self.cache_v[:batch_size, : start_pos + seq_len]
         # (B, Seq_Len_KV, H_KV * n_rep = H_Q, Head_Dim)
         keys = repeat_kv(keys, self.n_rep)
         # (B, Seq_Len_KV, H_KV * n_rep = H_Q, Head_Dim)
@@ -157,10 +165,13 @@ class SelfAttention(nn.Module):
 
         # (B, H_Q, 1, Head_Dim) @ (B, H_Q, Head_Dim, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if seq_len > 1:
+        if seq_len > 1 and mask is None:
             mask = torch.full((seq_len, seq_len), float("-inf"), device=x.device)
             mask = torch.triu(mask, diagonal=1)
             # Pad mask to match the keys length if start_pos > 0
+            mask = F.pad(mask, (start_pos, 0), value=0.0)
+            scores = scores + mask
+        elif mask is not None:
             mask = F.pad(mask, (start_pos, 0), value=0.0)
             scores = scores + mask
         # (B, H_Q, 1, Seq_Len_KV) -> (B, H_Q, 1, Seq_Len_KV)
@@ -221,11 +232,13 @@ class EncoderBlock(nn.Module):
             self,
             x: torch.Tensor,
             start_pos: int,
-            freqs_complex: torch.Tensor
+            freqs_complex: torch.Tensor,
+            mask: torch.Tensor,
+            use_cache = True
     ):
         
         # x: (Batch, 1, Dim)
-        h = x + self.attention(self.attention_norm(x), start_pos, freqs_complex)
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_complex, mask, use_cache = use_cache)
 
         return h + self.feed_forward(self.ffn_norm(h))
 
@@ -253,7 +266,7 @@ class Transformer(nn.Module):
                                                                 self.args.max_seq_len * 2, 
                                                                 device = self.args.device)
     
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor, start_pos: int, logical_pos: torch.Tensor = None, mask: torch.Tensor = None, use_cache = True):
         #(B, Seq_len)
         batch_size, seq_len = tokens.shape
 
@@ -261,11 +274,16 @@ class Transformer(nn.Module):
         h = self.tok_embeddings(tokens)
 
         # Retrieve the pairs (m, theta) corresponding to the positions [start_pos, start_pos + seq_len]
-        freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        if logical_pos is None:
+            freqs_complex = self.freqs_complex[start_pos:start_pos + seq_len]
+        else:
+            # start_pos is a Tensor containing an array of positions.
+            assert len(logical_pos) == seq_len, "Logical position must be equal to sequence length"
+            freqs_complex = self.freqs_complex[logical_pos]
         
         # Consecutively apply all the encoder layers
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_complex)
+            h = layer(h, start_pos, freqs_complex, mask, use_cache = use_cache)
         h = self.norm(h)
         output = self.output(h).float()
         return output

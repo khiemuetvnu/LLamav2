@@ -1,7 +1,7 @@
 import torch
 from pathlib import Path
 from inference import LLaMa
-from speculative_decoding import Speculative_Decoding
+from speculative_sampling import Speculative_Sampling
 
 if __name__ == '__main__':
 
@@ -9,8 +9,8 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() and allow_cuda else 'cpu'
 
     prompts = [
-        "Is chatgpt gay?"
-    ]
+        "Can you tell me about the best football player in the world?"
+        ]
     
     # Model P
     current_dir = Path(__file__).parent
@@ -43,11 +43,11 @@ if __name__ == '__main__':
     )
 
     # Vanilla Decoding
-    torch.manual_seed(0)
+    torch.manual_seed(42)
     out_tokens_0, out_texts_0 = model_p_1.text_completion(
         prompts,
-        temperature= 0.8,
-        max_gen_len= 256
+        temperature= 0.95,
+        max_gen_len= 512
     )
     assert len(out_texts_0) == len(prompts)
     for i in range(len(out_texts_0)):
@@ -55,14 +55,14 @@ if __name__ == '__main__':
         print('-' * 150)
 
 
-    spec_decoding = Speculative_Decoding(model_p, model_q)
+    spec_decoding = Speculative_Sampling(model_p, model_q)
     # Speculative Decoding
     torch.manual_seed(0)
     out_tokens_1, out_texts_1 = spec_decoding.text_completion(
         prompts,
         gamma = 5,
         temperature = 0.8,
-        max_gen_len= 256
+        max_gen_len= 512
     )
     assert len(out_texts_1) == len(prompts)
     for i in range(len(out_texts_1)):
