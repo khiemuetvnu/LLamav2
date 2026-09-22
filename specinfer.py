@@ -89,9 +89,11 @@ class SpecInfer():
             #Drafting
             #Example exp_config = [3, 2]
             draft_tokens = []
+            draft_tokens_vocab_probs = []
             logical_positions = []
 
             draft_tokens.append(tokens[:, cur_pos - 1:cur_pos]) # (B, 1)
+            #draft_tokens_vocab_probs.append(torch.zeros((batch_size, 1, self.args.vocab_size), device = device))
 
             logical_positions.append(cur_pos - 1)
             branching = 1
@@ -119,6 +121,7 @@ class SpecInfer():
                     for p_idx in range(prev_count):
                         for v in range(value):
                             draft_tokens.append(token_idx[:, p_idx, v : v+1])  # (B, 1)
+                            #draft_tokens_vocab_probs.append() #(B, 1)
                     prev_start += prev_count
                     prev_count *= value
             
@@ -131,10 +134,14 @@ class SpecInfer():
 
             probs_p = torch.softmax(logits_p, dim = -1) #(B, all_draft_token, vocab_size)
 
-            N = torch.cat([torch.zeros((probs_p.shape[0], 1, probs_p.shape[2]), device = device), probs_p[:, 0 : logits_p.shape[1] - 1, :]], dim = 1) #(B, all_draft_token, vocab_size)
+            # alignment
+            N_vocab_probs = torch.zeros_like(probs_p) #(B, all_draft_token, vocab_size)
+            for i, p in enumerate(parent_indices):
+                if p != -1:
+                    N_vocab_probs[:, i] = probs_p[:, p]
 
             # Accept and Reject
-            V = self.verify_greedy(O, N, parent_indices) # (B, accepted_token)
+            V = self.verify_greedy(O, N_vocab_probs, parent_indices) # (B, accepted_token)
             if V is None:
                 actual_accepted_token = 1
                 tokens[:, cur_pos : cur_pos + actual_accepted_token] = self.Mp._sample_top_k(probs_p[:, 0], k = top_k)
@@ -166,7 +173,7 @@ class SpecInfer():
         return (out_tokens, out_text)
 
 
-    def verify_greedy(self, O: torch.tensor, N: torch.tensor, parent_index: list):
+    def verify_greedy(self, O: torch.tensor, N_vocab_probs: torch.tensor, parent_index: list):
         # O (B, all_draft_token)
         # N (B, all_draft_token, vocab_size)
         # parent_index (all_draft_token, )
@@ -176,13 +183,17 @@ class SpecInfer():
         while keeping:
             keeping = False
             for index, p_index in enumerate(parent_index):
-                if p_index == root and (O[:, index] == torch.argmax(N[:, index], dim = -1)).all():
+                if p_index == root and (O[:, index] == torch.argmax(N_vocab_probs[:, index], dim = -1)).all():
                     keeping = True
                     V.append(O[:, index : index+1]) #(B, 1)
                     root = index 
                     break
         if len(V) != 0:
             return torch.cat(V[:], dim = 1) # (B, accepted_token)
+        return None
+
+    def verify_stochastic(self, O: torch.tensor, N_vocab_probs: torch.tensor, parent_index: list):
+
         return None
 
 
