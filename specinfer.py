@@ -34,7 +34,7 @@ class SpecInfer():
         return mask, parent_indices
 
     
-    def text_completion(self, prompts: list[str], exp_cfg: list[int], temperature: float = 0.6, top_p: float = 0.9, top_k: int = 3, max_gen_len: Optional[int] = None):
+    def text_completion(self, prompts: list[str], exp_cfg: list[int], temperature: float = 0.6, top_p: float = 0.9, top_k: int = 3, verify_greedy = True, max_gen_len: Optional[int] = None):
         device = self.args.device
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
@@ -89,11 +89,11 @@ class SpecInfer():
             #Drafting
             #Example exp_config = [3, 2]
             draft_tokens = []
-            draft_tokens_vocab_probs = []
+            draft_tokens_vocab_probs = [] 
             logical_positions = []
 
             draft_tokens.append(tokens[:, cur_pos - 1:cur_pos]) # (B, 1)
-            #draft_tokens_vocab_probs.append(torch.zeros((batch_size, 1, self.args.vocab_size), device = device))
+            draft_tokens_vocab_probs.append(torch.zeros((batch_size, 1, self.args.vocab_size), device = device)) # (B, 1, vocab_size)
 
             logical_positions.append(cur_pos - 1)
             branching = 1
@@ -121,7 +121,7 @@ class SpecInfer():
                     for p_idx in range(prev_count):
                         for v in range(value):
                             draft_tokens.append(token_idx[:, p_idx, v : v+1])  # (B, 1)
-                            #draft_tokens_vocab_probs.append() #(B, 1)
+                            draft_tokens_vocab_probs.append(sub_probs_q[:, p_idx : p_idx + 1, :]) #(B, 1, voab_size)
                     prev_start += prev_count
                     prev_count *= value
             
@@ -141,7 +141,11 @@ class SpecInfer():
                     N_vocab_probs[:, i] = probs_p[:, p]
 
             # Accept and Reject
-            V = self.verify_greedy(O, N_vocab_probs, parent_indices) # (B, accepted_token)
+            if verify_greedy:
+                V = self.verify_greedy(O, N_vocab_probs, parent_indices) # (B, accepted_token)
+            else: 
+                O_vocab_probs = torch.cat(draft_tokens_vocab_probs[:], dim = 1) #(B, all_draft_token, vocab_size)
+                V = self.verify_stochastic(O, O_vocab_probs, N_vocab_probs, parent_indices)
             if V is None:
                 actual_accepted_token = 1
                 tokens[:, cur_pos : cur_pos + actual_accepted_token] = self.Mp._sample_top_k(probs_p[:, 0], k = top_k)
@@ -192,8 +196,41 @@ class SpecInfer():
             return torch.cat(V[:], dim = 1) # (B, accepted_token)
         return None
 
-    def verify_stochastic(self, O: torch.tensor, N_vocab_probs: torch.tensor, parent_index: list):
-
+    def verify_stochastic(self, O: torch.tensor, O_vocab_probs: torch.tensor, N_vocab_probs: torch.tensor, parent_index: list):
+        # O (B, all_draft_token)
+        # O_vocab_probs (B, all_draft_token, vocab_size)
+        # N_vocab_probs (B, all_draft_token, vocab_size)
+        # parent_index (all_draft_token, )
+        root = 0
+        V = []
+        keeping = True
+        nodes = [node for node in range(len(parent_index))]
+        visited = {node : False for node in nodes}
+        r = torch.rand((O.shape[0], len(parent_index)), device = self.args.device)
+        while keeping:
+            keeping = False
+            for index, p_index in enumerate(parent_index):
+                if p_index == root and not visited[index]:
+                    q_prob = O_vocab_probs[:, index].gather(-1, O[:, index : index + 1]).squeeze(-1) #(B,) 
+                    p_prob = N_vocab_probs[:, index].gather(-1, O[:, index : index + 1]).squeeze(-1) #(B,)
+                    ratio = p_prob.div(q_prob + self.eps) #(B,)
+                    visited[index] = True
+                    keeping = True
+                    accepted = ratio > r[:, index] #(B,)
+                    if accepted.all():
+                        V.append(O[:, index : index+1]) #(B, 1)
+                        root = index 
+                        break
+                    else:
+                        resample_probs = torch.relu(N_vocab_probs[:, index] - O_vocab_probs[:, index])
+                        resample_probs_sum = resample_probs.sum(dim = -1, keepdim = True).clamp_min(self.eps)
+                        resample_probs.div_(resample_probs_sum) #(B, vocab_size)
+                        for sib_index, sib_p_index in enumerate(parent_index):
+                            if sib_p_index == root and not visited[sib_index]:
+                                N_vocab_probs[~accepted, sib_index] = resample_probs[~accepted]
+                        break
+        if len(V) != 0:
+            return torch.cat(V[:], dim = 1) # (B, accepted_token)
         return None
 
 

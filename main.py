@@ -10,7 +10,7 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() and allow_cuda else 'cpu'
 
     prompts = [
-        "Hello, im from china, how old are you?"
+        "ronaldo is gay?"
         ]
     
     # Model P
@@ -37,7 +37,7 @@ if __name__ == '__main__':
     # SpecInfer
     torch.manual_seed(42)
     SpecInfer = SpecInfer(model_p, model_q)
-    out_tokens_0, out_texts_0 = SpecInfer.text_completion(prompts, [2,2,1], max_gen_len = 512)
+    out_tokens_0, out_texts_0 = SpecInfer.text_completion(prompts, [2,2,1], max_gen_len = 256, verify_greedy = False)
     assert len(out_texts_0) == len(prompts)
     for i in range(len(out_texts_0)):
         print(f'{out_texts_0[i]}')
